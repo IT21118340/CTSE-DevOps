@@ -7,10 +7,10 @@ WORKDIR /app
 COPY package*.json ./
 
 # Install dependencies
-RUN npm ci
+RUN npm ci --ignore-scripts
 
 # Copy source code and env files
-COPY . .
+COPY .
 
 # Build the application
 RUN npm run build
@@ -24,13 +24,13 @@ WORKDIR /app
 COPY package*.json ./
 
 # Install production dependencies only
-RUN npm ci --production
+RUN npm ci --ignore-scripts --production
 
 # Copy built application from builder stage
 COPY --from=builder /app/dist ./dist
 
 # Copy environment files
-COPY .env* ./
+COPY .env ./
 
 # Create a non-root user
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup
