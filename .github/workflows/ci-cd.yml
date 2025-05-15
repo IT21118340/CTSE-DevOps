@@ -1,0 +1,149 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Create .env file
+        run: |
+          echo "PROD_DB_HOST=${{ secrets.PROD_DB_HOST }}" >> .env
+          echo "PROD_DB_PORT=${{ secrets.PROD_DB_PORT }}" >> .env
+          echo "PROD_DB_USERNAME=${{ secrets.PROD_DB_USERNAME }}" >> .env
+          echo "PROD_DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }}" >> .env
+          echo "PROD_DB_NAME=${{ secrets.PROD_DB_NAME }}" >> .env
+          echo "JWT_SECRET=${{ secrets.JWT_SECRET }}" >> .env
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@v2
+        with:
+          projectBaseDir: .
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_CLOUD_TOKEN }}
+          SONAR_PROJECT_KEY: ChillBroh_Accessra-API
+          SONAR_ORGANIZATION: chillbroh
+
+      - name: Build Docker Image
+        run: docker build -t chillbroh98/accessra .
+
+      - name: Login to docker hub
+        run: docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Publish image to docker hub
+        run: docker push chillbroh98/accessra:latest
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Download task definition
+        run: aws ecs describe-task-definition --task-definition accessra_app --query taskDefinition --output json > task-definition.json
+
+      - name: Install jq
+        run: sudo apt-get install -y jq
+
+      - name: Prepare clean task definition and update image
+        run: |
+          # Create a clean task definition by removing fields AWS doesn't allow on re-registration
+          jq 'del(.taskDefinitionArn, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy, .revision, .enableFaultInjection)' task-definition.json > clean-task-def.json
+
+          # Update the image URI in the container definition
+          CONTAINER_NAME="accessra-app"
+          jq --arg IMAGE "chillbroh98/accessra:latest" --arg NAME "$CONTAINER_NAME" '.containerDefinitions |= map(if .name == $NAME then .image = $IMAGE else . end)' clean-task-def.json > updated-task-def.json
+
+      - name: Register new task definition with AWS CLI
+        id: register-task-def
+        run: |
+          NEW_TASK_DEFINITION=$(aws ecs register-task-definition --cli-input-json file://updated-task-def.json --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "task_definition_arn=$NEW_TASK_DEFINITION" >> $GITHUB_OUTPUT
+
+      - name: Deploy to ECS with AWS CLI
+        run: |
+          aws ecs update-service --cluster accessra \
+                                --service accessra_app \
+                                --task-definition ${{ steps.register-task-def.outputs.task_definition_arn }} \
+                                --force-new-deployment
+
+      - name: Wait for service stability
+        run: aws ecs wait services-stable --cluster accessra --services accessra_app
+#
+#  build:
+#    needs: test
+#    runs-on: ubuntu-latest
+#
+#    steps:
+#      - uses: actions/checkout@v3
+#
+#      - name: Setup Node.js
+#        uses: actions/setup-node@v3
+#        with:
+#          node-version: '20.x'
+#          cache: 'npm'
+#
+#      - name: Install dependencies
+#        run: npm ci
+#
+#      - name: Build
+#        run: npm run build
+#
+#      - name: Upload build artifacts
+#        uses: actions/upload-artifact@v3
+#        with:
+#          name: dist
+#          path: dist/
+#
+#  deploy:
+#    needs: build
+#    runs-on: ubuntu-latest
+#    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+#
+#    steps:
+#      - uses: actions/checkout@v3
+#
+#      - name: Download build artifacts
+#        uses: actions/download-artifact@v3
+#        with:
+#          name: dist
+#          path: dist/
+#
+#      - name: Setup Node.js
+#        uses: actions/setup-node@v3
+#        with:
+#          node-version: '20.x'
+#
+#      - name: Install production dependencies
+#        run: npm ci --production
+#
+#      - name: Deploy to production
+#        run: |
+#          echo "Deploying to production..."
+#          # Add actual deployment commands (e.g. rsync, scp, SSH to server, Render/AWS CLI commands etc.)
+#        env:
+#          NODE_ENV: production
